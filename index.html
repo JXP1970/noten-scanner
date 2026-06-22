@@ -185,6 +185,40 @@
   }
   .toast.show { opacity: 1; }
 
+  /* ── Live-Kamera ── */
+  #camera-view { padding: 0; max-width: 100%; }
+  .cam-stage {
+    position: relative; background: #000; width: 100%;
+    height: calc(100vh - 150px); overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #cam-video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  /* Hilfsrahmen im A4-Hochformat zum Ausrichten des Blattes */
+  .cam-guide {
+    position: absolute; pointer-events: none; border: 2px dashed rgba(233,69,96,0.8);
+    border-radius: 6px; top: 5%; bottom: 5%; left: 50%; transform: translateX(-50%);
+    aspect-ratio: 210/297; max-width: 92%;
+  }
+  #cam-error {
+    display: none; flex-direction: column; align-items: center; justify-content: center;
+    position: absolute; inset: 16px; background: rgba(22,33,62,0.96);
+    border: 1px solid #0f3460; border-radius: 12px; color: #e0e0e0;
+    padding: 22px; text-align: center; line-height: 1.55; font-size: 0.95rem;
+  }
+  .cam-bar {
+    position: fixed; bottom: 0; left: 0; right: 0; background: #16213e;
+    border-top: 1px solid #0f3460; padding: 14px; z-index: 15;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .cam-side { flex: 1; display: flex; align-items: center; }
+  .cam-side.end { justify-content: flex-end; }
+  .cam-shutter {
+    width: 64px; height: 64px; border-radius: 50%; background: #e94560;
+    border: 4px solid #fff; box-shadow: 0 0 0 3px #e94560; flex: 0 0 auto;
+  }
+  .cam-shutter:hover { background: #c73652; }
+  .cam-shutter:disabled { background: #555; box-shadow: 0 0 0 3px #555; border-color: #999; }
+
   input[type=file] { display: none; }
 </style>
 </head>
@@ -284,6 +318,24 @@
   <div class="editor-foot">
     <button class="btn-ghost" id="btn-cancel">Abbrechen</button>
     <button class="btn-primary" id="btn-apply" style="flex:2">✓ Übernehmen</button>
+  </div>
+</div>
+
+<!-- ══════════════ LIVE-KAMERA ══════════════ -->
+<div class="view" id="camera-view">
+  <div class="cam-stage">
+    <video id="cam-video" playsinline autoplay muted></video>
+    <div class="cam-guide"></div>
+    <div id="cam-error"></div>
+  </div>
+  <div class="cam-bar">
+    <div class="cam-side">
+      <button class="btn-ghost" id="cam-cancel">Abbrechen</button>
+    </div>
+    <button id="cam-shoot" class="cam-shutter" title="Auslösen"></button>
+    <div class="cam-side end">
+      <button class="btn-ghost" id="cam-switch" style="display:none" title="Kamera wechseln">⟲ Kamera</button>
+    </div>
   </div>
 </div>
 
@@ -970,8 +1022,88 @@ async function makeThumb(img, cornersN, mode) {
 // ════════════════════════════════════════════════════════════════════════
 //  Bilder aufnehmen / importieren
 // ════════════════════════════════════════════════════════════════════════
-$('btn-camera').onclick = () => $('file-camera').click();
+$('btn-camera').onclick = () => openCamera();
 $('btn-gallery').onclick = () => $('file-gallery').click();
+
+// ════════════════════════════════════════════════════════════════════════
+//  Live-Kamera (getUserMedia) – funktioniert auf Surface/Desktop & Handy.
+//  Braucht einen sicheren Kontext (https oder localhost); sonst Datei-Dialog.
+// ════════════════════════════════════════════════════════════════════════
+let camStream = null, camDevices = [], camIndex = 0;
+
+async function openCamera() {
+  const supported = navigator.mediaDevices && navigator.mediaDevices.getUserMedia;
+  // Ohne sicheren Kontext liefert getUserMedia nichts -> direkt Datei-Dialog.
+  if (!supported || !window.isSecureContext) { $('file-camera').click(); return; }
+  showView('camera-view');
+  $('cam-error').style.display = 'none';
+  $('cam-shoot').disabled = false;
+  await startStream();
+}
+
+async function startStream(deviceId) {
+  stopStream();
+  const video = deviceId
+    ? { deviceId: { exact: deviceId } }
+    : { facingMode: { ideal: 'environment' },
+        width: { ideal: 3840 }, height: { ideal: 2160 } };
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({ audio: false, video });
+    const v = $('cam-video');
+    v.srcObject = camStream;
+    await v.play().catch(() => {});
+    $('cam-error').style.display = 'none';
+    $('cam-shoot').disabled = false;
+    // Kamera-Labels gibt es erst nach erteilter Erlaubnis.
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    camDevices = devs.filter(d => d.kind === 'videoinput');
+    $('cam-switch').style.display = camDevices.length > 1 ? 'block' : 'none';
+  } catch (err) {
+    showCamError(err);
+  }
+}
+
+function stopStream() {
+  if (camStream) { camStream.getTracks().forEach(t => t.stop()); camStream = null; }
+  const v = $('cam-video'); if (v) v.srcObject = null;
+}
+
+function showCamError(err) {
+  stopStream();
+  let msg;
+  if (err && err.name === 'NotAllowedError')
+    msg = 'Kamerazugriff wurde abgelehnt. Bitte in der Adressleiste die Kamera erlauben und es erneut versuchen.';
+  else if (err && (err.name === 'NotFoundError' || err.name === 'OverconstrainedError'))
+    msg = 'Keine Kamera gefunden.';
+  else
+    msg = 'Die Kamera konnte nicht gestartet werden.';
+  const e = $('cam-error');
+  e.innerHTML = `<p style="margin:0 0 16px">${msg}</p>
+    <button class="btn-primary" id="cam-fallback" style="max-width:260px">📁 Datei / Foto wählen</button>`;
+  e.style.display = 'flex';
+  $('cam-shoot').disabled = true;
+  $('cam-fallback').onclick = () => { stopStream(); showView('start-view'); $('file-camera').click(); };
+}
+
+$('cam-cancel').onclick = () => { stopStream(); showView('start-view'); };
+
+$('cam-switch').onclick = () => {
+  if (camDevices.length < 2) return;
+  camIndex = (camIndex + 1) % camDevices.length;
+  startStream(camDevices[camIndex].deviceId);
+};
+
+$('cam-shoot').onclick = async () => {
+  const v = $('cam-video');
+  if (!v.videoWidth) return;
+  const c = document.createElement('canvas');
+  c.width = v.videoWidth; c.height = v.videoHeight;
+  c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+  stopStream();
+  const dataUrl = canvasToScaledDataUrl(c, 2600);
+  showView('start-view');
+  await addPageFromDataUrl(dataUrl, true);
+};
 
 $('file-camera').onchange = async (e) => {
   const file = e.target.files[0];
@@ -1005,9 +1137,21 @@ function defaultCorners() {
 }
 
 async function addPageFromFile(file, openForEdit) {
+  let dataUrl;
+  try {
+    dataUrl = await fileToScaledDataUrl(file);
+  } catch (err) {
+    toast('Fehler beim Laden des Bildes');
+    console.error(err);
+    return;
+  }
+  await addPageFromDataUrl(dataUrl, openForEdit);
+}
+
+// Gemeinsamer Pfad für Datei-Import, Galerie und Live-Kamera.
+async function addPageFromDataUrl(dataUrl, openForEdit) {
   showOverlay('Lade Bild …', '');
   try {
-    const dataUrl = await fileToScaledDataUrl(file);
     const img = await loadImage(dataUrl);
     const corners = detectDocument(img) || defaultCorners();
     const mode = settings.mode;
@@ -1023,6 +1167,18 @@ async function addPageFromFile(file, openForEdit) {
     toast('Fehler beim Laden des Bildes');
     console.error(err);
   }
+}
+
+// Canvas -> herunterskaliertes JPEG-dataURL (wie fileToScaledDataUrl, aber für Canvas/Video).
+function canvasToScaledDataUrl(srcCanvas, maxDim = 2600) {
+  let w = srcCanvas.width, h = srcCanvas.height;
+  const scale = Math.min(1, maxDim / Math.max(w, h));
+  if (scale >= 1) return srcCanvas.toDataURL('image/jpeg', 0.92);
+  w = Math.round(w * scale); h = Math.round(h * scale);
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  c.getContext('2d').drawImage(srcCanvas, 0, 0, w, h);
+  return c.toDataURL('image/jpeg', 0.92);
 }
 
 // ════════════════════════════════════════════════════════════════════════
