@@ -290,6 +290,7 @@
     <span class="title" id="editor-title">Seite zuschneiden</span>
     <div class="spacer"></div>
     <button class="btn-ghost" id="btn-split" title="Doppelseite: in zwei A4-Seiten teilen">📖 Doppel</button>
+    <button class="btn-ghost" id="btn-deskew" title="Schräge automatisch begradigen">📐 Gerade</button>
     <button class="btn-ghost" id="btn-auto" title="Ränder automatisch erkennen">⊡ Auto</button>
     <button class="btn-ghost" id="btn-rotate" title="Drehen">↻</button>
     <button class="btn-ghost" id="btn-full" title="Ganze Seite">⤢</button>
@@ -375,7 +376,7 @@
 // Jede Seite:  { id, original (dataURL, rotationskorrigiert), corners[4] {x,y} (0..1),
 //                mode ('color'|'gray'|'bw'), thumb (dataURL) }
 let pages = [];
-let settings = { fname: 'Noten', mode: 'bw', dpi: 200, camId: null };
+let settings = { fname: 'Noten', mode: 'bw', dpi: 200, camId: null, deskew: true };
 let editIndex = -1;        // Index der gerade bearbeiteten Seite
 let editState = null;      // { img, corners, mode }
 let lastPdfBlob = null, lastPdfName = '';
@@ -714,9 +715,67 @@ function removeBorderBlobs(data, w, h) {
   }
 }
 
+// Schätzt die Restschräge (in Grad) anhand der waagrechten Notenlinien:
+// Für mehrere Testwinkel werden die Tinten-Pixel zeilenweise aufsummiert; der
+// Winkel mit der größten Varianz (= schärfste Linien-Peaks) ist die Schräglage.
+function estimateSkewDeg(srcCanvas) {
+  const TW = 700;
+  const s = Math.min(1, TW / srcCanvas.width);
+  const w = Math.max(1, Math.round(srcCanvas.width * s));
+  const h = Math.max(1, Math.round(srcCanvas.height * s));
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const cx = c.getContext('2d'); cx.drawImage(srcCanvas, 0, 0, w, h);
+  const d = cx.getImageData(0, 0, w, h).data;
+  const ink = new Uint8Array(w * h);
+  for (let p = 0, i = 0; p < w * h; p++, i += 4) {
+    ink[p] = (d[i]*0.299 + d[i+1]*0.587 + d[i+2]*0.114) < 160 ? 1 : 0;
+  }
+  const cxp = w / 2;
+  let bestAng = 0, bestScore = -1;
+  const rows = new Float32Array(h);
+  for (let deg = -7; deg <= 7.0001; deg += 0.5) {
+    const tanr = Math.tan(deg * Math.PI / 180);
+    rows.fill(0);
+    for (let x = 0; x < w; x++) {
+      const shift = (x - cxp) * tanr;
+      for (let y = 0; y < h; y++) {
+        if (!ink[y * w + x]) continue;
+        const yy = (y + shift) | 0;
+        if (yy >= 0 && yy < h) rows[yy]++;
+      }
+    }
+    let mean = 0; for (let y = 0; y < h; y++) mean += rows[y]; mean /= h;
+    let v = 0; for (let y = 0; y < h; y++) { const dd = rows[y] - mean; v += dd * dd; }
+    if (v > bestScore) { bestScore = v; bestAng = deg; }
+  }
+  return bestAng;
+}
+
+// Dreht einen Canvas um deg Grad (um die Mitte), weißer Hintergrund.
+function rotateCanvas(src, deg) {
+  const w = src.width, h = src.height;
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const cx = c.getContext('2d');
+  cx.fillStyle = '#fff'; cx.fillRect(0, 0, w, h);
+  cx.translate(w / 2, h / 2); cx.rotate(deg * Math.PI / 180); cx.translate(-w / 2, -h / 2);
+  cx.imageSmoothingEnabled = true; cx.imageSmoothingQuality = 'high';
+  cx.drawImage(src, 0, 0);
+  return c;
+}
+
 // Erzeugt aus Quellbild + Ecken + Modus einen fertigen Canvas (A4-Verhältnis).
-function processToCanvas(img, cornersN, mode, outW, outH) {
-  const imgData = warp(img, cornersN, outW, outH);
+function processToCanvas(img, cornersN, mode, outW, outH, deskew) {
+  let imgData = warp(img, cornersN, outW, outH);
+  // Vor der Binarisierung: Restschräge automatisch begradigen.
+  if (deskew) {
+    const tmp = document.createElement('canvas'); tmp.width = outW; tmp.height = outH;
+    tmp.getContext('2d').putImageData(imgData, 0, 0);
+    const ang = estimateSkewDeg(tmp);
+    if (Math.abs(ang) >= 0.3) {
+      const rot = rotateCanvas(tmp, ang);
+      imgData = rot.getContext('2d').getImageData(0, 0, outW, outH);
+    }
+  }
   const d = imgData.data;
   if (mode === 'bw') {
     adaptiveThreshold(d, outW, outH);
@@ -1260,7 +1319,7 @@ function defaultCorners() {
 
 function makePage(original, corners, mode, thumb) {
   return { id: Date.now() + '_' + Math.random().toString(36).slice(2),
-           original, corners, mode, thumb };
+           original, corners, mode, thumb, deskew: !!settings.deskew };
 }
 
 function lerpPt(a, b, t) { return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t }; }
@@ -1362,13 +1421,15 @@ async function openEditor(index, suggestSplit) {
     corners: p.corners.map(c => ({ x: c.x, y: c.y })),
     mode: p.mode,
     split: !!suggestSplit,    // Doppelseite teilen?
-    splitPos: 0.5             // Falzposition 0..1 entlang der Breite
+    splitPos: 0.5,            // Falzposition 0..1 entlang der Breite
+    deskew: p.deskew !== undefined ? p.deskew : !!settings.deskew
   };
   $('editor-title').textContent = `Seite ${index + 1} zuschneiden`;
   // Modus-Buttons
   document.querySelectorAll('#edit-mode-seg button').forEach(b =>
     b.classList.toggle('on', b.dataset.mode === editState.mode));
   updateSplitUI();
+  updateDeskewUI();
   if (suggestSplit) toast('Doppelseite erkannt – wird in zwei A4-Seiten geteilt');
   layoutEditor();
   showView('editor-view');
@@ -1376,6 +1437,9 @@ async function openEditor(index, suggestSplit) {
 
 function updateSplitUI() {
   $('btn-split').classList.toggle('on', !!(editState && editState.split));
+}
+function updateDeskewUI() {
+  $('btn-deskew').classList.toggle('on', !!(editState && editState.deskew));
 }
 
 function layoutEditor() {
@@ -1577,6 +1641,16 @@ $('btn-split').onclick = () => {
     : 'Doppelseite aus');
 };
 
+$('btn-deskew').onclick = () => {
+  editState.deskew = !editState.deskew;
+  updateDeskewUI();
+  // Als Standard für neue Seiten übernehmen.
+  settings.deskew = editState.deskew; persist();
+  toast(editState.deskew
+    ? 'Auto-Begradigen an – in „Vorschau" sichtbar'
+    : 'Auto-Begradigen aus');
+};
+
 $('btn-auto').onclick = () => {
   const found = detectDocument(editState.img);
   if (found) {
@@ -1624,13 +1698,13 @@ function reorderCorners(pts) {
 $('btn-preview').onclick = () => {
   showOverlay('Erzeuge Vorschau …', '');
   setTimeout(() => {
-    const urls = [];
+    const urls = [], dsk = editState.deskew;
     if (editState.split) {
       const [L, R] = splitCorners(editState.corners, editState.splitPos);
-      urls.push(processToCanvas(editState.img, L, editState.mode, 360, 509).toDataURL('image/jpeg', 0.85));
-      urls.push(processToCanvas(editState.img, R, editState.mode, 360, 509).toDataURL('image/jpeg', 0.85));
+      urls.push(processToCanvas(editState.img, L, editState.mode, 360, 509, dsk).toDataURL('image/jpeg', 0.85));
+      urls.push(processToCanvas(editState.img, R, editState.mode, 360, 509, dsk).toDataURL('image/jpeg', 0.85));
     } else {
-      urls.push(processToCanvas(editState.img, editState.corners, editState.mode, 420, 594).toDataURL('image/jpeg', 0.85));
+      urls.push(processToCanvas(editState.img, editState.corners, editState.mode, 420, 594, dsk).toDataURL('image/jpeg', 0.85));
     }
     hideOverlay();
     showPreviewModal(urls);
@@ -1687,11 +1761,13 @@ $('btn-apply').onclick = async () => {
       const [L, R] = splitCorners(editState.corners, editState.splitPos);
       const pL = makePage(p.original, L, mode, await makeThumb(img, L, mode));
       const pR = makePage(p.original, R, mode, await makeThumb(img, R, mode));
+      pL.deskew = pR.deskew = editState.deskew;
       pages.splice(editIndex, 1, pL, pR);
       toast('In zwei Seiten geteilt');
     } else {
       p.corners = editState.corners.map(c => ({ x: c.x, y: c.y }));
       p.mode = mode;
+      p.deskew = editState.deskew;
       p.thumb = await makeThumb(img, p.corners, p.mode);
     }
     editState = null;
@@ -1731,7 +1807,7 @@ async function createPdf() {
       await new Promise(r => setTimeout(r, 10)); // UI atmen lassen
       const p = pages[i];
       const img = await loadImage(p.original);
-      const c = processToCanvas(img, p.corners, p.mode, w, h);
+      const c = processToCanvas(img, p.corners, p.mode, w, h, p.deskew);
       // S/W ist Strichgrafik -> hohe Qualität gegen JPEG-Schmutz an den Linien.
       const q = p.mode === 'bw' ? 0.95 : 0.9;
       const bytes = await canvasToJpegBytes(c, q);
