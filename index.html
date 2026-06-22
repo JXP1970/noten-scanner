@@ -372,7 +372,7 @@
 // Jede Seite:  { id, original (dataURL, rotationskorrigiert), corners[4] {x,y} (0..1),
 //                mode ('color'|'gray'|'bw'), thumb (dataURL) }
 let pages = [];
-let settings = { fname: 'Noten', mode: 'bw', dpi: 200 };
+let settings = { fname: 'Noten', mode: 'bw', dpi: 200, camId: null };
 let editIndex = -1;        // Index der gerade bearbeiteten Seite
 let editState = null;      // { img, corners, mode }
 let lastPdfBlob = null, lastPdfName = '';
@@ -1038,29 +1038,74 @@ async function openCamera() {
   showView('camera-view');
   $('cam-error').style.display = 'none';
   $('cam-shoot').disabled = false;
-  await startStream();
+  await initCamera();
 }
 
+// Startet einen Stream – per deviceId, oder (ohne) bevorzugt die Rückkamera.
 async function startStream(deviceId) {
   stopStream();
   const video = deviceId
-    ? { deviceId: { exact: deviceId } }
-    : { facingMode: { ideal: 'environment' },
-        width: { ideal: 3840 }, height: { ideal: 2160 } };
+    ? { deviceId: { exact: deviceId }, width: { ideal: 3840 }, height: { ideal: 2160 } }
+    : { facingMode: { ideal: 'environment' }, width: { ideal: 3840 }, height: { ideal: 2160 } };
+  camStream = await navigator.mediaDevices.getUserMedia({ audio: false, video });
+  const v = $('cam-video');
+  v.srcObject = camStream;
+  await v.play().catch(() => {});
+  $('cam-error').style.display = 'none';
+  $('cam-shoot').disabled = false;
+}
+
+// Erkennt nach hinten/außen gerichtete Kameras am Namen (Selfie ausschließen).
+function isRearCamera(label) {
+  const s = (label || '').toLowerCase();
+  if (/front|user|face|selfie|innen|ir\b/.test(s)) return false;
+  return /back|rear|rück|ruck|environment|world|außen|aussen/.test(s);
+}
+
+function currentDeviceId() {
+  const track = camStream && camStream.getVideoTracks()[0];
+  return track ? (track.getSettings().deviceId || null) : null;
+}
+
+function cleanLabel(l) { return (l || 'Kamera').replace(/\s*\([0-9a-f]{4}:[0-9a-f]{4}\)\s*$/i, ''); }
+
+function showCamName() {
+  const d = camDevices[camIndex];
+  if (d) toast('Kamera: ' + cleanLabel(d.label));
+}
+
+// Holt Zugriff, listet Kameras auf und wählt – falls noch nichts gemerkt –
+// automatisch die Rückkamera. Die Wahl wird gespeichert.
+async function initCamera() {
   try {
-    camStream = await navigator.mediaDevices.getUserMedia({ audio: false, video });
-    const v = $('cam-video');
-    v.srcObject = camStream;
-    await v.play().catch(() => {});
-    $('cam-error').style.display = 'none';
-    $('cam-shoot').disabled = false;
-    // Kamera-Labels gibt es erst nach erteilter Erlaubnis.
-    const devs = await navigator.mediaDevices.enumerateDevices();
-    camDevices = devs.filter(d => d.kind === 'videoinput');
-    $('cam-switch').style.display = camDevices.length > 1 ? 'block' : 'none';
+    await startStream(settings.camId || null);
   } catch (err) {
-    showCamError(err);
+    // Gemerkte Kamera nicht mehr verfügbar -> ohne Vorgabe neu versuchen.
+    if (settings.camId) {
+      settings.camId = null;
+      try { await startStream(null); } catch (e) { return showCamError(e); }
+    } else { return showCamError(err); }
   }
+
+  // Labels gibt es erst nach erteilter Erlaubnis.
+  const devs = await navigator.mediaDevices.enumerateDevices();
+  camDevices = devs.filter(d => d.kind === 'videoinput');
+
+  // Ohne gemerkte Wahl: automatisch die Rückkamera nehmen, falls vorhanden.
+  if (!settings.camId) {
+    const rear = camDevices.find(d => isRearCamera(d.label));
+    if (rear && rear.deviceId && rear.deviceId !== currentDeviceId()) {
+      try { await startStream(rear.deviceId); } catch (e) { /* bei der aktuellen bleiben */ }
+    }
+    settings.camId = currentDeviceId();
+    persist();
+  }
+
+  const activeId = currentDeviceId();
+  const idx = camDevices.findIndex(d => d.deviceId === activeId);
+  camIndex = idx >= 0 ? idx : 0;
+  $('cam-switch').style.display = camDevices.length > 1 ? 'block' : 'none';
+  showCamName();
 }
 
 function stopStream() {
@@ -1087,10 +1132,15 @@ function showCamError(err) {
 
 $('cam-cancel').onclick = () => { stopStream(); showView('start-view'); };
 
-$('cam-switch').onclick = () => {
+$('cam-switch').onclick = async () => {
   if (camDevices.length < 2) return;
   camIndex = (camIndex + 1) % camDevices.length;
-  startStream(camDevices[camIndex].deviceId);
+  try {
+    await startStream(camDevices[camIndex].deviceId);
+    settings.camId = camDevices[camIndex].deviceId;
+    persist();
+    showCamName();
+  } catch (e) { showCamError(e); }
 };
 
 $('cam-shoot').onclick = async () => {
